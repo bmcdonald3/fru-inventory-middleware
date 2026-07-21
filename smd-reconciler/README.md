@@ -91,6 +91,224 @@ go run ./cmd/server/ serve
 ./smd-reconciler serve
 ```
 
+### Validated Integration Test (Copy-Paste Working Example)
+
+This section shows the **exact commands** that were tested and validated to work end-to-end with real services. You can copy and paste these commands to reproduce the same results.
+
+#### Step 1: Start fru-tracker Service
+
+Open a terminal and run:
+
+```bash
+cd ~/fru-tracker
+mkdir -p data
+rm -f data/fru-tracker.db
+go run ./cmd/server serve --database-url="file:./data/fru-tracker.db?cache=shared&_fk=1"
+```
+
+Wait for this message:
+```
+Server starting on 0.0.0.0:8080
+```
+
+#### Step 2: Start inventory-service Service
+
+Open a **second terminal** and run:
+
+```bash
+cd ~/inventory-service
+mkdir -p data
+rm -f data/inventory-service.db
+go run ./cmd/server serve --database-url="file:./data/inventory-service.db?cache=shared&_fk=1" --port 8081
+```
+
+Wait for this message:
+```
+Server starting on 0.0.0.0:8081
+```
+
+#### Step 3: Build and Configure smd-reconciler
+
+Open a **third terminal** and run:
+
+```bash
+# Build the smd-reconciler
+cd ~/fru-inventory-middleware/smd-reconciler
+go build -o bin/smd-reconciler ./cmd/server
+
+# Create configuration file for localhost
+cat > ~/.smd-reconciler.yaml << 'EOF'
+fru_tracker_url: http://localhost:8080
+inventory_service_url: http://localhost:8081
+port: 8082
+data_dir: ./smd-data
+EOF
+
+# Start the service
+./bin/smd-reconciler serve --port 8082
+```
+
+You should see:
+```
+Using config file: /Users/benmcdonald/.smd-reconciler.yaml
+Starting smd-reconciler server...
+Event subscriber started
+Server starting on 0.0.0.0:8082
+```
+
+#### Step 4: Create Test Devices
+
+Open a **fourth terminal** and create a discovery snapshot with test data:
+
+```bash
+# Create test discovery snapshot
+cat > /tmp/discovery-snapshot.json << 'EOF'
+{
+  "apiVersion": "example.fabrica.dev/v1",
+  "kind": "DiscoverySnapshot",
+  "metadata": {
+    "name": "test-snapshot-001"
+  },
+  "spec": {
+    "rawData": [
+      {
+        "deviceType": "Node",
+        "serialNumber": "NODE001",
+        "manufacturer": "HP",
+        "properties": {
+          "redfish_uri": "/Systems/NODE001"
+        }
+      },
+      {
+        "deviceType": "Node",
+        "serialNumber": "NODE002",
+        "manufacturer": "Dell",
+        "properties": {
+          "redfish_uri": "/Systems/NODE002"
+        }
+      },
+      {
+        "deviceType": "DIMM",
+        "serialNumber": "DIMM001",
+        "parentSerialNumber": "NODE001",
+        "properties": {
+          "redfish_uri": "/Systems/NODE001/Memory/1"
+        }
+      }
+    ]
+  }
+}
+EOF
+
+# Send to fru-tracker
+curl -s -X POST http://localhost:8080/discoverysnapshots \
+  -H "Content-Type: application/json" \
+  -d @/tmp/discovery-snapshot.json | jq '.metadata | {name, uid}'
+```
+
+Expected output:
+```json
+{
+  "name": "test-snapshot-001",
+  "uid": "discoverysnapshot-<random>"
+}
+```
+
+#### Step 5: Verify Sync (Wait 35 seconds)
+
+Wait for the polling cycle (the service polls every 30 seconds), then run:
+
+```bash
+# Check what was synced to inventory-service
+curl -s http://localhost:8081/components | jq '.'
+```
+
+#### Expected Output
+
+You should see **2 components** (NODE001 and NODE002), and **NOT** DIMM001 (which is correctly filtered):
+
+```json
+[
+  {
+    "apiVersion": "v1",
+    "kind": "Component",
+    "metadata": {
+      "name": "x-NODE001",
+      "uid": "component-7262137c",
+      "createdAt": "2026-07-21T14:15:53.969969-07:00",
+      "updatedAt": "2026-07-21T14:15:53.969969-07:00"
+    },
+    "id": "x-NODE001",
+    "spec": {
+      "ID": "x-NODE001",
+      "Type": "Node",
+      "State": "Ready",
+      "Flag": "OK",
+      "Enabled": true,
+      "NetType": "Sling",
+      "Arch": "X86",
+      "Class": "River"
+    },
+    "status": {
+      "ready": false
+    }
+  },
+  {
+    "apiVersion": "v1",
+    "kind": "Component",
+    "metadata": {
+      "name": "x-NODE002",
+      "uid": "component-af657e22",
+      "createdAt": "2026-07-21T14:15:53.975919-07:00",
+      "updatedAt": "2026-07-21T14:15:53.975919-07:00"
+    },
+    "id": "x-NODE002",
+    "spec": {
+      "ID": "x-NODE002",
+      "Type": "Node",
+      "State": "Ready",
+      "Flag": "OK",
+      "Enabled": true,
+      "NetType": "Sling",
+      "Arch": "X86",
+      "Class": "River"
+    },
+    "status": {
+      "ready": false
+    }
+  }
+]
+```
+
+#### What You Should See in Logs
+
+**In smd-reconciler terminal (Step 3):**
+
+First polling cycle (after ~30 seconds):
+```
+Processing 2 translated components
+Created component x-NODE001 (uid: component-7262137c)
+Created component x-NODE002 (uid: component-af657e22)
+Successfully synced 2 components to inventory-service
+```
+
+Second polling cycle (30 seconds later):
+```
+Processing 2 translated components
+Successfully synced 2 components to inventory-service
+```
+
+Notice the second cycle doesn't say "Created" - this demonstrates **idempotent behavior** (no duplicates created on re-sync).
+
+#### Validation Checklist
+
+✅ **Device Filtering**: Only NODE001 and NODE002 appear in inventory-service, DIMM001 is correctly filtered out  
+✅ **Schema Translation**: Device serial numbers are prefixed with `x-` (x-NODE001, x-NODE002)  
+✅ **Component Creation**: All spec fields populated (Type, State, Flag, Enabled, etc.)  
+✅ **UID Caching**: Second sync uses cached UIDs (fast path, no "Created" messages)  
+✅ **Idempotent Behavior**: No duplicate components created on re-sync  
+✅ **Metadata**: Components have proper metadata with uid, createdAt, updatedAt timestamps  
+
 ### Configuration
 
 The service is configured via:
