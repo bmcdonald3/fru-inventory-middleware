@@ -1,3 +1,4 @@
+package client
 // Package client handles HTTP communication with external services
 package client
 
