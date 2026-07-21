@@ -26,16 +26,19 @@ type InventoryComponent struct {
 	Metadata struct {
 		Name string `json:"name"`
 	} `json:"metadata"`
-	Spec struct {
-		ID      string `json:"ID"`
-		Type    string `json:"Type"`
-		State   string `json:"State"`
-		Flag    string `json:"Flag"`
-		Enabled bool   `json:"Enabled"`
-		NetType string `json:"NetType"`
-		Arch    string `json:"Arch"`
-		Class   string `json:"Class"`
-	} `json:"spec"`
+	Spec InventoryComponentSpec `json:"spec"`
+}
+
+// InventoryComponentSpec matches the actual inventory-service Component.Spec structure
+type InventoryComponentSpec struct {
+	ID      string `json:"ID"`
+	Type    string `json:"Type"`
+	State   string `json:"State"`
+	Flag    string `json:"Flag"`
+	Enabled *bool  `json:"Enabled"` // Pointer to bool to match actual API
+	NetType string `json:"NetType"`
+	Arch    string `json:"Arch"`
+	Class   string `json:"Class"`
 }
 
 // TranslateDevice translates a fru-tracker device to an inventory-service component
@@ -53,7 +56,8 @@ func TranslateDevice(device *FruTrackerDevice) (*InventoryComponent, error) {
 	component.Spec.Type = "Node"
 	component.Spec.State = "Ready"
 	component.Spec.Flag = "OK"
-	component.Spec.Enabled = true
+	enabled := true
+	component.Spec.Enabled = &enabled // Use pointer for Enabled field
 	component.Spec.NetType = "Sling"
 	component.Spec.Arch = "X86"
 	component.Spec.Class = "River"

@@ -1,4 +1,3 @@
-package client
 // Package client handles HTTP communication with external services
 package client
 
@@ -9,20 +8,43 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sync"
 
 	"github.com/openchami/smd-reconciler/internal/translator"
 )
 
+// InventoryComponent represents the full response from inventory-service
+type InventoryComponent struct {
+	APIVersion string `json:"apiVersion,omitempty"`
+	Kind       string `json:"kind,omitempty"`
+	Metadata   struct {
+		Name      string `json:"name"`
+		UID       string `json:"uid"`
+		CreatedAt string `json:"createdAt,omitempty"`
+		UpdatedAt string `json:"updatedAt,omitempty"`
+	} `json:"metadata"`
+	ID     string                            `json:"id,omitempty"`
+	Spec   translator.InventoryComponentSpec `json:"spec"`
+	Status struct {
+		Phase   string `json:"phase,omitempty"`
+		Message string `json:"message,omitempty"`
+		Ready   bool   `json:"ready"`
+	} `json:"status,omitempty"`
+}
+
 // InventoryClient handles communication with inventory-service
 type InventoryClient struct {
-	baseURL string
-	client  *http.Client
+	baseURL    string
+	client     *http.Client
+	uidCache   map[string]string // Maps spec.ID -> metadata.uid
+	cacheMutex sync.RWMutex
 }
 
 // NewInventoryClient creates a new inventory service client
 func NewInventoryClient(baseURL string) *InventoryClient {
 	return &InventoryClient{
-		baseURL: baseURL,
+		baseURL:  baseURL,
+		uidCache: make(map[string]string),
 		client: &http.Client{
 			Timeout: 0, // No timeout for long-running operations
 		},
@@ -31,7 +53,24 @@ func NewInventoryClient(baseURL string) *InventoryClient {
 
 // SyncComponent syncs a component to inventory-service with idempotency handling
 func (ic *InventoryClient) SyncComponent(component *translator.InventoryComponent) error {
-	getURL := fmt.Sprintf("%s/components/%s", ic.baseURL, component.Spec.ID)
+	// Check cache first for the UID
+	ic.cacheMutex.RLock()
+	uid, cached := ic.uidCache[component.Spec.ID]
+	ic.cacheMutex.RUnlock()
+
+	if cached {
+		// We know the UID, try to fetch it
+		return ic.updateOrFetchComponent(component, uid)
+	}
+
+	// Try to find the component by listing (since we don't have UID)
+	// This is less efficient but necessary on first sync
+	return ic.findAndSyncComponent(component)
+}
+
+// updateOrFetchComponent attempts to update or fetch a component by its known UID
+func (ic *InventoryClient) updateOrFetchComponent(component *translator.InventoryComponent, uid string) error {
+	getURL := fmt.Sprintf("%s/components/%s", ic.baseURL, uid)
 
 	// Check if component exists
 	resp, err := ic.client.Get(getURL)
@@ -42,18 +81,21 @@ func (ic *InventoryClient) SyncComponent(component *translator.InventoryComponen
 
 	switch resp.StatusCode {
 	case http.StatusNotFound:
-		// Create new component
-		return ic.createComponent(component)
+		// UID became invalid, clear cache and try to find it again
+		ic.cacheMutex.Lock()
+		delete(ic.uidCache, component.Spec.ID)
+		ic.cacheMutex.Unlock()
+		return ic.findAndSyncComponent(component)
 	case http.StatusOK:
 		// Component exists, check if update is needed
-		var existing translator.InventoryComponent
+		var existing InventoryComponent
 		if err := json.NewDecoder(resp.Body).Decode(&existing); err != nil {
 			return fmt.Errorf("failed to decode existing component: %w", err)
 		}
 
 		// Compare and update if different
-		if !componentsEqual(component, &existing) {
-			return ic.updateComponent(component)
+		if !specEqual(&component.Spec, &existing.Spec) {
+			return ic.updateComponentByUID(component, uid, existing.Metadata.UID)
 		}
 		return nil
 	case http.StatusInternalServerError:
@@ -62,15 +104,65 @@ func (ic *InventoryClient) SyncComponent(component *translator.InventoryComponen
 		return nil
 	default:
 		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("unexpected status code %d: %s", resp.StatusCode, string(body))
+		log.Printf("Unexpected status %d from inventory-service: %s", resp.StatusCode, string(body))
+		return nil
 	}
+}
+
+// findAndSyncComponent searches for a component by listing and syncs it
+func (ic *InventoryClient) findAndSyncComponent(component *translator.InventoryComponent) error {
+	// List all components
+	url := fmt.Sprintf("%s/components", ic.baseURL)
+	resp, err := ic.client.Get(url)
+	if err != nil {
+		return fmt.Errorf("failed to list components: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("Failed to list components: %d\n", resp.StatusCode)
+		return nil
+	}
+
+	var components []InventoryComponent
+	if err := json.NewDecoder(resp.Body).Decode(&components); err != nil {
+		return fmt.Errorf("failed to decode components: %w", err)
+	}
+
+	// Search for component by spec.ID
+	for _, existing := range components {
+		if existing.Spec.ID == component.Spec.ID {
+			// Found it! Cache the UID and check if update needed
+			ic.cacheMutex.Lock()
+			ic.uidCache[component.Spec.ID] = existing.Metadata.UID
+			ic.cacheMutex.Unlock()
+
+			if !specEqual(&component.Spec, &existing.Spec) {
+				return ic.updateComponentByUID(component, existing.Metadata.UID, existing.Metadata.UID)
+			}
+			return nil
+		}
+	}
+
+	// Not found, create it
+	return ic.createComponent(component)
 }
 
 // createComponent creates a new component in inventory-service
 func (ic *InventoryClient) createComponent(component *translator.InventoryComponent) error {
 	url := fmt.Sprintf("%s/components", ic.baseURL)
 
-	data, err := json.Marshal(component)
+	// Prepare request body with only spec
+	requestBody := map[string]interface{}{
+		"apiVersion": "inventory-service.openchami.org/v1",
+		"kind":       "Component",
+		"metadata": map[string]string{
+			"name": component.Spec.ID,
+		},
+		"spec": component.Spec,
+	}
+
+	data, err := json.Marshal(requestBody)
 	if err != nil {
 		return fmt.Errorf("failed to marshal component: %w", err)
 	}
@@ -87,15 +179,38 @@ func (ic *InventoryClient) createComponent(component *translator.InventoryCompon
 		return nil // Gracefully handle errors
 	}
 
-	log.Printf("Created component %s\n", component.Spec.ID)
+	// Extract UID from response and cache it
+	var respComponent InventoryComponent
+	if err := json.NewDecoder(resp.Body).Decode(&respComponent); err != nil {
+		log.Printf("Failed to decode create response: %v\n", err)
+		return nil
+	}
+
+	ic.cacheMutex.Lock()
+	ic.uidCache[component.Spec.ID] = respComponent.Metadata.UID
+	ic.cacheMutex.Unlock()
+
+	log.Printf("Created component %s (uid: %s)\n", component.Spec.ID, respComponent.Metadata.UID)
 	return nil
 }
 
-// updateComponent updates an existing component in inventory-service
-func (ic *InventoryClient) updateComponent(component *translator.InventoryComponent) error {
-	url := fmt.Sprintf("%s/components/%s", ic.baseURL, component.Spec.ID)
+// updateComponentByUID updates an existing component using its UID
+func (ic *InventoryClient) updateComponentByUID(component *translator.InventoryComponent, uid string, metadataUID string) error {
+	url := fmt.Sprintf("%s/components/%s", ic.baseURL, uid)
 
-	data, err := json.Marshal(component)
+	// Prepare request body with metadata including UID
+	requestBody := map[string]interface{}{
+		"apiVersion": "inventory-service.openchami.org/v1",
+		"kind":       "Component",
+		"metadata": map[string]string{
+			"name": component.Spec.ID,
+			"uid":  metadataUID,
+		},
+		"id":   component.Spec.ID,
+		"spec": component.Spec,
+	}
+
+	data, err := json.Marshal(requestBody)
 	if err != nil {
 		return fmt.Errorf("failed to marshal component: %w", err)
 	}
@@ -123,10 +238,10 @@ func (ic *InventoryClient) updateComponent(component *translator.InventoryCompon
 	return nil
 }
 
-// componentsEqual checks if two components are equal
-func componentsEqual(c1, c2 *translator.InventoryComponent) bool {
-	data1, _ := json.Marshal(c1.Spec)
-	data2, _ := json.Marshal(c2.Spec)
+// specEqual checks if two component specs are equal
+func specEqual(s1, s2 *translator.InventoryComponentSpec) bool {
+	data1, _ := json.Marshal(s1)
+	data2, _ := json.Marshal(s2)
 	return bytes.Equal(data1, data2)
 }
 
