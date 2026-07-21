@@ -1,0 +1,32 @@
+project:
+    name: smd-reconciler
+    module: github.com/user/smd-reconciler
+    created: 2026-07-21T13:49:37.803683-07:00
+features:
+    validation:
+        enabled: true
+        mode: strict
+    events:
+        enabled: true
+        bus_type: memory
+    conditional:
+        enabled: true
+        etag_algorithm: sha256
+    auth:
+        enabled: false
+    storage:
+        enabled: true
+        type: file
+        db_driver: sqlite3
+    reconciliation:
+        enabled: false
+        worker_count: 5
+        requeue_delay: 5
+generation:
+    handlers: true
+    storage: true
+    client: true
+    openapi: true
+    events: true
+    middleware: true
+    reconciliation: false
